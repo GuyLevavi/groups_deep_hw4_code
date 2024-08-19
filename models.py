@@ -5,6 +5,7 @@ from torch import nn
 import torch.nn.functional as F
 from itertools import permutations
 from torch.utils.data import DataLoader
+from torchmetrics import Accuracy
 import lightning as L
 
 
@@ -12,27 +13,71 @@ def inv_perm(a):
     return torch.argsort(a)
 
 
-class StandardNetwork(nn.Module):
+class AbstractNetwork(L.LightningModule):
+    def __init__(self):
+        super().__init__()
+        self.train_accuracy = Accuracy(task='binary')
+        self.val_accuracy = Accuracy(task='binary')
+
+    def forward(self, x):
+        raise NotImplementedError
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x).mean(dim=2)
+        # binary cross entropy
+        loss = F.binary_cross_entropy_with_logits(y_hat, y.view(-1, 1))
+        self.log('train_loss', loss, prog_bar=True)
+        self.train_accuracy(y_hat, y.view(-1, 1))
+        return loss
+
+    def on_train_epoch_end(self):
+        self.log('train_acc', self.train_accuracy, prog_bar=True)
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x).mean(dim=2)
+        # binary cross entropy
+        loss = F.binary_cross_entropy_with_logits(y_hat, y.view(-1, 1))
+        self.log('val_loss', loss, prog_bar=True)
+        self.val_accuracy(y_hat, y.view(-1, 1))
+        return loss
+
+    def on_validation_epoch_end(self):
+        self.log('val_acc', self.val_accuracy, prog_bar=True)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        return optimizer
+
+
+class StandardNetwork(AbstractNetwork):
     # used with augmentation
-    def __init__(self, input_dim, hidden_dim, output_dim):
+    def __init__(self, input_dim, output_dim):
         super().__init__()
         assert output_dim == input_dim or output_dim == 1
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.fc1 = nn.Linear(input_dim, input_dim)
+        self.fc2 = nn.Linear(input_dim, input_dim)
+        self.fc3 = nn.Linear(input_dim, input_dim)
+        self.fc4 = nn.Linear(input_dim, output_dim)
 
     def forward(self, x):
         # x - (B, n, d) where B is batch size, d is input dimension, n is number of points
         x = x.transpose(1, 2)
         x = F.relu(self.fc1(x))
-        x = self.fc2(x)
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = self.fc4(x)
         return x.transpose(1, 2)
 
 
-class CanonizationNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
+class CanonizationNetwork(AbstractNetwork):
+    def __init__(self, input_dim):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, 1)
+        self.fc1 = nn.Linear(input_dim, input_dim)
+        self.fc2 = nn.Linear(input_dim, input_dim)
+        self.fc3 = nn.Linear(input_dim, input_dim)
+        self.fc4 = nn.Linear(input_dim, 1)
 
     def forward(self, x):
         # x - (B, n, d) where B is batch size, d is input dimension, n is number of points
@@ -41,17 +86,21 @@ class CanonizationNetwork(nn.Module):
         x = torch.gather(x, 1, indices)
         x = x.transpose(1, 2)
         x = F.relu(self.fc1(x))
-        x = self.fc2(x)
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = self.fc4(x)
         return x.transpose(1, 2)
 
 
-class SymmetrizationNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, n_sampled_permutations=None):
+class SymmetrizationNetwork(AbstractNetwork):
+    def __init__(self, input_dim, output_dim, n_sampled_permutations=None):
         super().__init__()
         assert output_dim == input_dim or output_dim == 1  # equivariant or invariant
         self.type = 'equivariant' if output_dim == input_dim else 'invariant'
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.fc1 = nn.Linear(input_dim, input_dim)
+        self.fc2 = nn.Linear(input_dim, input_dim)
+        self.fc3 = nn.Linear(input_dim, input_dim)
+        self.fc4 = nn.Linear(input_dim, output_dim)
         if n_sampled_permutations is not None:
             self.n_sampled_permutations = n_sampled_permutations
             self.perms = None
@@ -60,12 +109,12 @@ class SymmetrizationNetwork(nn.Module):
             self.perms = [torch.LongTensor(perm) for perm in list(permutations(range(input_dim)))]
             self.n_sampled_permutations = None
 
-
-
     def forward_single(self, x):
         x = x.transpose(1, 2)
         x = F.relu(self.fc1(x))
-        x = self.fc2(x)
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = self.fc4(x)
         return x.transpose(1, 2)
 
     def forward(self, x):
@@ -92,7 +141,7 @@ class EquivariantLinearLayer(nn.Module):
         self.type = 'equivariant' if output_dim == input_dim else 'invariant'
         self.alpha = nn.Parameter(torch.Tensor(1)) if self.type == 'equivariant' else None
         self.beta = nn.Parameter(torch.Tensor(1))
-        self.bias = nn.Parameter(torch.Tensor(output_dim))  # in case of equivariant will be broadcasted
+        self.bias = nn.Parameter(torch.Tensor(1))
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -106,22 +155,31 @@ class EquivariantLinearLayer(nn.Module):
         # where 1 is a vector of ones
         mean = x.mean(dim=1, keepdim=True)
         if self.type == 'equivariant':
-            x = self.alpha * x + self.beta * mean + self.bias[None, :, None]
+            x = self.alpha * x + self.beta * mean + self.bias
         else:
-            x = self.beta * mean + self.bias[None, :, None]
+            x = self.beta * mean + self.bias
         return x
 
 
-class InternalNetwork(nn.Module):
+class IntrinsicNetwork(AbstractNetwork):
     def __init__(self, input_dim, output_dim):
         super().__init__()
         self.fc1 = EquivariantLinearLayer(input_dim, input_dim)
-        self.fc2 = EquivariantLinearLayer(input_dim, output_dim)
+        # self.fc2 = EquivariantLinearLayer(input_dim, input_dim)
+        # self.fc3 = EquivariantLinearLayer(input_dim, input_dim)
+        self.fc4 = EquivariantLinearLayer(input_dim, output_dim)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
-        x = self.fc2(x)
+        # x = F.relu(self.fc2(x))
+        # x = F.relu(self.fc3(x))
+        x = self.fc4(x)
         return x
+
+    # def on_train_epoch_end(self):
+    #     # print all parameters
+    #     for name, param in self.named_parameters():
+    #         print(name, param)
 
 
 def is_equivariant(network, input_dim, feature_dim, n_trials):
@@ -146,17 +204,16 @@ def is_equivariant(network, input_dim, feature_dim, n_trials):
     # print('out(input_permed):\n', y_input_permed[0, :, :])
 
 
-
 if __name__ == '__main__':
     torch.manual_seed(1)
     n = 5
     d = 3
     n_trials = 100
-    is_equivariant(InternalNetwork(n, n), n, d, n_trials)
-    is_equivariant(InternalNetwork(n, 1), n, d, n_trials)
-    is_equivariant(SymmetrizationNetwork(n, 10, n), n, d, n_trials)
-    is_equivariant(SymmetrizationNetwork(n, 10, 1), n, d, n_trials)
-    is_equivariant(SymmetrizationNetwork(n, 10, n, 100), n, d, n_trials)
-    is_equivariant(SymmetrizationNetwork(n, 10, 1, 100), n, d, n_trials)
-    is_equivariant(CanonizationNetwork(n, n), n, d, n_trials)
-    is_equivariant(StandardNetwork(n, 2*n, n), n, d, n_trials)
+    is_equivariant(IntrinsicNetwork(n, n), n, d, n_trials)
+    is_equivariant(IntrinsicNetwork(n, 1), n, d, n_trials)
+    is_equivariant(SymmetrizationNetwork(n, n), n, d, n_trials)
+    is_equivariant(SymmetrizationNetwork(n, 1), n, d, n_trials)
+    is_equivariant(SymmetrizationNetwork(n, n, 100), n, d, n_trials)
+    is_equivariant(SymmetrizationNetwork(n, 1, 100), n, d, n_trials)
+    is_equivariant(CanonizationNetwork(n), n, d, n_trials)
+    is_equivariant(StandardNetwork(n, n), n, d, n_trials)
