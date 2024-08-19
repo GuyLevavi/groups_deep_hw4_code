@@ -53,69 +53,55 @@ class AbstractNetwork(L.LightningModule):
 
 class StandardNetwork(AbstractNetwork):
     # used with augmentation
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, output_dim, channels=(5, 64, 128, 5)):
         super().__init__()
         assert output_dim == input_dim or output_dim == 1
-        self.fc1 = nn.Linear(input_dim, input_dim)
-        self.fc2 = nn.Linear(input_dim, input_dim)
-        self.fc3 = nn.Linear(input_dim, input_dim)
-        self.fc4 = nn.Linear(input_dim, output_dim)
+        self.fc1 = nn.Linear(input_dim * channels[0], input_dim * channels[1])
+        self.fc2 = nn.Linear(input_dim * channels[1], input_dim * channels[2])
+        self.fc3 = nn.Linear(input_dim * channels[2], output_dim * channels[3])
+        self.output_dim = output_dim
+        self.output_channels = channels[3]
 
     def forward(self, x):
         # x - (B, n, d) where B is batch size, d is input dimension, n is number of points
-        x = x.transpose(1, 2)
+        x = x.reshape(x.shape[0], -1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        x = self.fc4(x)
-        return x.transpose(1, 2)
+        x = self.fc3(x)
+        return x.reshape(x.shape[0], self.output_dim, self.output_channels)
 
 
-class CanonizationNetwork(AbstractNetwork):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, input_dim)
-        self.fc2 = nn.Linear(input_dim, input_dim)
-        self.fc3 = nn.Linear(input_dim, input_dim)
-        self.fc4 = nn.Linear(input_dim, 1)
+class CanonizationNetwork(StandardNetwork):
+    def __init__(self, input_dim, channels=(5, 64, 128, 5)):
+        super().__init__(input_dim, 1, channels)
 
     def forward(self, x):
-        # x - (B, n, d) where B is batch size, d is input dimension, n is number of points
-        # canonization is simply sorting the input
         indices = torch.argsort(x, dim=1)
         x = torch.gather(x, 1, indices)
-        x = x.transpose(1, 2)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        x = self.fc4(x)
-        return x.transpose(1, 2)
+        x = super().forward(x)
+        return x
 
 
-class SymmetrizationNetwork(AbstractNetwork):
-    def __init__(self, input_dim, output_dim, n_sampled_permutations=None):
-        super().__init__()
+class SymmetrizationNetwork(StandardNetwork):
+    def __init__(self, input_dim, output_dim, channels=(5, 64, 128, 5), n_sampled_permutations=None):
         assert output_dim == input_dim or output_dim == 1  # equivariant or invariant
+        super().__init__(input_dim, output_dim, channels)
         self.type = 'equivariant' if output_dim == input_dim else 'invariant'
-        self.fc1 = nn.Linear(input_dim, input_dim)
-        self.fc2 = nn.Linear(input_dim, input_dim)
-        self.fc3 = nn.Linear(input_dim, input_dim)
-        self.fc4 = nn.Linear(input_dim, output_dim)
         if n_sampled_permutations is not None:
             self.n_sampled_permutations = n_sampled_permutations
             self.perms = None
-            SymmetrizationNetwork.__name__ += 'Sampled'
+            SymmetrizationNetwork.__name__ = f'SymmetrizationNetworkSampled{n_sampled_permutations}'
         else:
             self.perms = [torch.LongTensor(perm) for perm in list(permutations(range(input_dim)))]
             self.n_sampled_permutations = None
+            SymmetrizationNetwork.__name__ = 'SymmetrizationNetwork'
 
     def forward_single(self, x):
-        x = x.transpose(1, 2)
+        x = x.reshape(x.shape[0], -1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        x = self.fc4(x)
-        return x.transpose(1, 2)
+        x = self.fc3(x)
+        return x.reshape(x.shape[0], self.output_dim, self.output_channels)
 
     def forward(self, x):
         # x - (B, n, d) where B is batch size, d is input dimension, n is number of points
@@ -135,54 +121,39 @@ class SymmetrizationNetwork(AbstractNetwork):
 
 
 class EquivariantLinearLayer(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, output_dim, in_channels=1, out_channels=1):
         super().__init__()
         assert output_dim == input_dim or output_dim == 1
         self.type = 'equivariant' if output_dim == input_dim else 'invariant'
-        self.alpha = nn.Parameter(torch.Tensor(1)) if self.type == 'equivariant' else None
-        self.beta = nn.Parameter(torch.Tensor(1))
-        self.bias = nn.Parameter(torch.Tensor(1))
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        if self.type == 'equivariant':
-            nn.init.constant_(self.alpha, 1)
-        nn.init.constant_(self.beta, 1)
-        nn.init.constant_(self.bias, 0)
+        self.alpha = nn.Linear(in_channels, out_channels) if self.type == 'equivariant' else None
+        self.beta = nn.Linear(in_channels, out_channels)
 
     def forward(self, x):
         # alpha * x + beta * 1 * 1^T * x + bias * 1
         # where 1 is a vector of ones
         mean = x.mean(dim=1, keepdim=True)
         if self.type == 'equivariant':
-            x = self.alpha * x + self.beta * mean + self.bias
+            x = self.alpha(x) + self.beta(mean)
         else:
-            x = self.beta * mean + self.bias
+            x = self.beta(mean)
         return x
 
 
 class IntrinsicNetwork(AbstractNetwork):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, output_dim, channels=(5, 64, 128, 5)):
         super().__init__()
-        self.fc1 = EquivariantLinearLayer(input_dim, input_dim)
-        # self.fc2 = EquivariantLinearLayer(input_dim, input_dim)
-        # self.fc3 = EquivariantLinearLayer(input_dim, input_dim)
-        self.fc4 = EquivariantLinearLayer(input_dim, output_dim)
+        self.fc1 = EquivariantLinearLayer(input_dim, input_dim, channels[0], channels[1])
+        self.fc2 = EquivariantLinearLayer(input_dim, input_dim, channels[1], channels[2])
+        self.fc3 = EquivariantLinearLayer(input_dim, output_dim, channels[2], channels[3])
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
-        # x = F.relu(self.fc2(x))
-        # x = F.relu(self.fc3(x))
-        x = self.fc4(x)
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
         return x
 
-    # def on_train_epoch_end(self):
-    #     # print all parameters
-    #     for name, param in self.named_parameters():
-    #         print(name, param)
 
-
-def is_equivariant(network, input_dim, feature_dim, n_trials):
+def is_equivariant(network, input_dim, feature_dim, n_trials, debug=False):
     # checks empirically if the network is equivariant or invariant
     x = torch.randn(n_trials, input_dim, feature_dim)
     perms = [torch.randperm(input_dim) for _ in range(n_trials)]
@@ -197,11 +168,12 @@ def is_equivariant(network, input_dim, feature_dim, n_trials):
         y_permed = y
     res = torch.allclose(y_input_permed, y_permed, atol=1e-3)
     print('{} is {} : {}'.format(network.__class__.__name__, type, res))
-    # print('perms:\n', perms[0])
-    # print('input:\n', x[0, :, :])
-    # print('input_permed:\n', x_permed[0, :, :])
-    # print('out(input):\n', y[0, :, :])
-    # print('out(input_permed):\n', y_input_permed[0, :, :])
+    if debug:
+        print('perms:\n', perms[0])
+        print('input:\n', x[0, :, :])
+        print('input_permed:\n', x_permed[0, :, :])
+        print('out(input):\n', y[0, :, :])
+        print('out(input_permed):\n', y_input_permed[0, :, :])
 
 
 if __name__ == '__main__':
@@ -209,11 +181,12 @@ if __name__ == '__main__':
     n = 5
     d = 3
     n_trials = 100
-    is_equivariant(IntrinsicNetwork(n, n), n, d, n_trials)
-    is_equivariant(IntrinsicNetwork(n, 1), n, d, n_trials)
-    is_equivariant(SymmetrizationNetwork(n, n), n, d, n_trials)
-    is_equivariant(SymmetrizationNetwork(n, 1), n, d, n_trials)
-    is_equivariant(SymmetrizationNetwork(n, n, 100), n, d, n_trials)
-    is_equivariant(SymmetrizationNetwork(n, 1, 100), n, d, n_trials)
-    is_equivariant(CanonizationNetwork(n), n, d, n_trials)
-    is_equivariant(StandardNetwork(n, n), n, d, n_trials)
+    channels = (d, 32, 64, 1)
+    is_equivariant(IntrinsicNetwork(n, n, channels), n, d, n_trials)
+    is_equivariant(IntrinsicNetwork(n, 1, channels), n, d, n_trials)
+    is_equivariant(SymmetrizationNetwork(n, n, channels), n, d, n_trials)
+    is_equivariant(SymmetrizationNetwork(n, 1, channels), n, d, n_trials)
+    is_equivariant(SymmetrizationNetwork(n, n, channels, 100), n, d, n_trials)
+    is_equivariant(SymmetrizationNetwork(n, 1, channels, 100), n, d, n_trials)
+    is_equivariant(CanonizationNetwork(n, channels), n, d, n_trials)
+    is_equivariant(StandardNetwork(n, n, channels), n, d, n_trials)
