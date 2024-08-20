@@ -7,6 +7,7 @@ from itertools import permutations
 from torch.utils.data import DataLoader
 from torchmetrics import Accuracy
 import lightning as L
+import wandb
 
 
 def inv_perm(a):
@@ -23,6 +24,8 @@ class AbstractNetwork(L.LightningModule):
         raise NotImplementedError
 
     def training_step(self, batch, batch_idx):
+        if self.global_step == 0:
+            wandb.define_metric("train_acc", summary="max")
         x, y = batch
         y_hat = self(x).mean(dim=2)
         # binary cross entropy
@@ -35,9 +38,10 @@ class AbstractNetwork(L.LightningModule):
         self.log('train_acc', self.train_accuracy, prog_bar=True)
 
     def validation_step(self, batch, batch_idx):
+        if self.global_step == 0:
+            wandb.define_metric("val_acc", summary="max")
         x, y = batch
         y_hat = self(x).mean(dim=2)
-        # binary cross entropy
         loss = F.binary_cross_entropy_with_logits(y_hat, y.view(-1, 1))
         self.log('val_loss', loss, prog_bar=True)
         self.val_accuracy(y_hat, y.view(-1, 1))

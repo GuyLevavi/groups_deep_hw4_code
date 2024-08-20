@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 from models import CanonizationNetwork, SymmetrizationNetwork, IntrinsicNetwork, StandardNetwork
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+from datetime import timedelta
 
 
 class GaussianDataset(torch.utils.data.Dataset):
@@ -38,7 +39,7 @@ if __name__ == '__main__':
     train_val_split = 0.8
     d = 5
     batch_size = 256
-    channels = (d, 64, 128, 1)
+    channels = (d, 32, 64, 1)
 
     for n_samples in [100, 1000, 10000]:
         for n in [10, 100]:
@@ -55,21 +56,22 @@ if __name__ == '__main__':
             models = [StandardNetwork(n, 1, channels),
                       CanonizationNetwork(n, channels),
                       SymmetrizationNetwork(n, 1, channels, 100),
-                      SymmetrizationNetwork(n, 1, channels, 1000),
                       IntrinsicNetwork(n, 1, channels)]
             for model in models:
                 model_name = type(model).__name__
                 run_name = f'{model_name}_n_samples_{n_samples}_n_{n}_d_{d}'
-                # early_stopping = EarlyStopping('val_acc', patience=15)
-                wandb_logger = WandbLogger(log_model='all', name=run_name)
+                early_stopping = EarlyStopping('val_acc', patience=10)
+                wandb_logger = WandbLogger(log_model=False, name=run_name)
                 wandb_logger.log_hyperparams({
                     'n_samples': n_samples,
                     'n': n,
                     'd': d,
                     'model': model_name
                 })
-                trainer = L.Trainer(max_epochs=250, logger=wandb_logger,
-                                    check_val_every_n_epoch=10)  # callbacks=[early_stopping],
+                trainer = L.Trainer(logger=wandb_logger,
+                                    check_val_every_n_epoch=5,
+                                    max_time=timedelta(hours=0.5),
+                                    callbacks=[early_stopping])
                 tloader = train_aug_loader if type(model) == StandardNetwork else train_loader
                 vloader = val_aug_loader if type(model) == StandardNetwork else val_loader
                 trainer.fit(model=model, train_dataloaders=tloader, val_dataloaders=vloader)
